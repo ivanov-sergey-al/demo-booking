@@ -2,12 +2,16 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\StoreBookingRequest;
 use App\Models\Booking;
 use App\Models\Room;
 use Carbon\Carbon;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
 
 class BookingController extends Controller
 {
@@ -18,33 +22,49 @@ class BookingController extends Controller
             ->paginate(20);
     }
 
-    public function store(Request $request)
+    public function store(StoreBookingRequest $request): JsonResponse
     {
-        $conflict = DB::select("SELECT id FROM bookings
-            WHERE room_id = {$request->room_id}
-            AND starts_at <= '{$request->ends_at}'
-            AND ends_at >= '{$request->starts_at}'");
+        $validated = $request->validated();        
 
-        if ($conflict) {
-            return response()->json(['error' => 'Комната занята'], 409);
-        }
+        $booking = DB::transaction(function () use ($request, $validated): Booking {
+            $startsAt = Carbon::parse($validated['starts_at'])->utc();
+            $endsAt = Carbon::parse($validated['ends_at'])->utc();
 
-        $start = Carbon::parse($request->starts_at);
-        if ($start->hour < 9 || $start->hour >= 20) {
-            return response()->json(['error' => 'Нерабочее время'], 422);
-        }
+            Room::query()->lockForUpdate()->findOrFail($validated['room_id']);
 
-        $booking = Booking::create($request->all());
+            $hasConflict = Booking::query()
+                ->where('room_id', $validated['room_id'])
+                ->where('starts_at', '<', $endsAt)
+                ->where('ends_at', '>', $startsAt)
+                ->exists();
 
-        Log::withContext(['booking_id' => $booking->id]);
-        Log::channel('bookings')->info('Booking created');
+            if ($hasConflict) {
+                throw ValidationException::withMessages(['room_id' => 'Комната уже занята в указанный промежуток времени.']);
+            }
 
-        return $booking;
+            return Booking::create([
+                'room_id' => $validated['room_id'],
+                'user_id' => auth()->id(),
+                'title' => $validated['title'],
+                'starts_at' => $startsAt,
+                'ends_at' => $endsAt,
+            ]);
+        });
+
+        Log::channel('bookings')->info('Booking created', ['booking_id' => $booking->id]);
+
+        return response()->json($booking, 201);
     }
 
-    public function destroy($id)
+    public function destroy(int $id)
     {
-        Booking::findOrFail($id)->delete();
+        $booking = Booking::where('id', $id)->firstOrFail();
+
+        if ($booking->user_id !== auth()->id()) {
+            abort(403);
+        }
+
+        $booking->delete();
 
         return response()->noContent();
     }
@@ -52,8 +72,7 @@ class BookingController extends Controller
     public function today(Room $room)
     {
         return $room->bookings()
-            ->whereDate('starts_at', today())
-            ->get()
+            ->whereDate('starts_at', today())->get()
             ->map(fn ($b) => [
                 'time' => $b->starts_at . ' – ' . $b->ends_at,
                 'author' => $b->user->name,
